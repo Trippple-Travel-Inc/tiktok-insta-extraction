@@ -1,0 +1,13 @@
+[project]
+name = "tiktok-insta-extraction"
+version = "0.1.0"
+description = "Extract caption and metadata from TikTok and Instagram URLs"
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp>=2025.1.0",
+    "anthropic>=0.92.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+extract = "extract:main"
