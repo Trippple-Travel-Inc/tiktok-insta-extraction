@@ -40,9 +40,27 @@ uv run python extract.py "https://vm.tiktok.com/abc123/"
 }
 ```
 
+## Local API server
+
+For use from the trippple-react Import Itinerary modal:
+
+```bash
+doppler run --project trippple-recs-engine --config dev --command \
+  'ANTHROPIC_API_KEY="$CLAUDE_HAIKU" uv run uvicorn server:app --host 0.0.0.0 --port 8765 --reload'
+```
+
+Smoke test:
+
+```bash
+curl -s -X POST localhost:8765/tiktok/extract \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.tiktok.com/@sagevanalstine/video/7236850924650548523"}' | jq
+```
+
+The mobile app reaches this from a phone over LAN — set
+`EXPO_PUBLIC_TIKTOK_API_URL=http://<mac-lan-ip>:8765` in `trippple-react/.env.local`.
+
 ## What's next
 
 - Instagram extraction (with burner-account login fallback)
-- LLM place-name extraction from captions
-- Geocoding via Mapbox
-- Frame sampling + vision model for on-screen text
+- Hosting decision (Render / fly.io / fold into trippple-core) after a week of local use

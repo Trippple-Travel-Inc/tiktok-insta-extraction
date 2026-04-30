@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -114,6 +115,51 @@ def scrape_page_data(url: str) -> dict:
         "diversification_labels": item.get("diversificationLabels") or [],
         "location_created": item.get("locationCreated"),
     }
+
+
+def fetch_comments(aweme_id: str, referer: str, count: int = 50) -> list[dict]:
+    """Pull top comments via TikTok's unsigned web comment-list endpoint.
+
+    No auth required. Returns a list of {text, digg_count} dicts, sorted by likes.
+    Used only as a fallback when caption/transcript/stickers yield no places.
+    """
+    if not aweme_id:
+        return []
+    params = {
+        "aweme_id": aweme_id,
+        "count": str(count),
+        "cursor": "0",
+        "aid": "1988",
+        "app_name": "tiktok_web",
+        "device_platform": "web",
+        "os": "mac",
+    }
+    url = "https://www.tiktok.com/api/comment/list/?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": referer,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for c in data.get("comments") or []:
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({"text": text, "digg_count": int(c.get("digg_count") or 0)})
+    out.sort(key=lambda c: c["digg_count"], reverse=True)
+    return out
 
 
 def get_transcript(info: dict) -> Optional[str]:
