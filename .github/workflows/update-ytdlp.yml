@@ -1,0 +1,74 @@
+name: Update yt-dlp (nightly)
+
+# Keeps the deployed extraction service on the latest yt-dlp nightly so
+# TikTok/Instagram breakages get patched automatically — with NO mobile-app
+# update required (yt-dlp runs entirely server-side).
+#
+# Flow: bump the locked yt-dlp version -> sanity-check it imports/runs ->
+# commit to main -> Render auto-deploys the push (and/or a deploy hook fires).
+
+on:
+  schedule:
+    # 06:00 UTC daily — after yt-dlp publishes the previous night's nightly.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {} # allow manual "update now" from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-ytdlp
+  cancel-in-progress: false
+
+jobs:
+  update-ytdlp:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Bump yt-dlp to latest nightly
+        run: uv lock --upgrade-package yt-dlp --prerelease allow
+
+      - name: Stop if nothing changed
+        id: diff
+        run: |
+          if git diff --quiet uv.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "yt-dlp already on the latest nightly — nothing to do."
+          else
+            NEW=$(grep -A1 'name = "yt-dlp"' uv.lock | grep version | head -1 | sed -E 's/.*"(.*)".*/\1/')
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new_version=$NEW" >> "$GITHUB_OUTPUT"
+            echo "Bumping yt-dlp to $NEW"
+          fi
+
+      - name: Sanity-check the new build imports & runs
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          uv sync --frozen
+          uv run python -c "import yt_dlp; print('yt_dlp', yt_dlp.version.__version__)"
+          uv run yt-dlp --version
+
+      - name: Commit & push to main
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore(deps): bump yt-dlp to ${{ steps.diff.outputs.new_version }} (nightly auto-update)"
+          git push origin main
+
+      - name: Trigger Render deploy (optional)
+        # No-op unless a RENDER_DEPLOY_HOOK_URL secret is configured. Most Render
+        # services auto-deploy on push to main; this is a belt-and-suspenders
+        # for setups where auto-deploy is off.
+        if: steps.diff.outputs.changed == 'true' && env.RENDER_DEPLOY_HOOK_URL != ''
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" && echo "Render deploy triggered"
