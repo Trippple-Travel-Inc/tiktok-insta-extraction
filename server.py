@@ -1,16 +1,17 @@
 """FastAPI wrapper around extract.py / places.py for the trippple-react import flow."""
 
+import os
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yt_dlp.utils import DownloadError
 
 from extract import extract, fetch_comments
 from extract_instagram import extract_instagram
-from places import extract_places
+from places import extract_places, extract_places_from_text
 
 app = FastAPI(title="trippple tiktok extraction")
 
@@ -27,8 +28,30 @@ app.add_middleware(
 )
 
 
+# Opt-in shared-key gate for the Claude-backed extract endpoints. Only enforced
+# when EXTRACT_API_KEY is set in the environment, so local dev keeps working
+# without config. Rotatable independently of the Anthropic key and scoped to
+# these endpoints only. NOTE: the mobile app ships this key in its bundle, so it
+# deters casual abuse but isn't a strong secret — pair it with rate limiting,
+# and move to per-user JWT auth for the robust end state.
+EXTRACT_API_KEY = os.environ.get("EXTRACT_API_KEY")
+
+# Cap freeform input so a giant paste can't run up an unbounded Claude bill.
+MAX_TEXT_CHARS = 16000
+
+
+def require_key(x_extract_key: Optional[str] = Header(default=None)) -> None:
+    if EXTRACT_API_KEY and x_extract_key != EXTRACT_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid or missing X-Extract-Key")
+
+
 class ExtractRequest(BaseModel):
     url: str
+    city_hint: Optional[str] = None
+
+
+class TextExtractRequest(BaseModel):
+    text: str
     city_hint: Optional[str] = None
 
 
@@ -38,7 +61,7 @@ def health() -> dict:
 
 
 @app.post("/tiktok/extract")
-def tiktok_extract(req: ExtractRequest) -> dict:
+def tiktok_extract(req: ExtractRequest, _: None = Depends(require_key)) -> dict:
     started = time.perf_counter()
     try:
         info = extract(req.url)
@@ -107,7 +130,7 @@ def tiktok_extract(req: ExtractRequest) -> dict:
 
 
 @app.post("/instagram/extract")
-def instagram_extract(req: ExtractRequest) -> dict:
+def instagram_extract(req: ExtractRequest, _: None = Depends(require_key)) -> dict:
     started = time.perf_counter()
     try:
         info = extract_instagram(req.url)
@@ -144,5 +167,46 @@ def instagram_extract(req: ExtractRequest) -> dict:
         "author": info.get("author"),
         "canonical_url": info.get("canonical_url"),
         "_places_ms": places_ms,
+        "_elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+
+
+@app.post("/text/extract")
+def text_extract(req: TextExtractRequest, _: None = Depends(require_key)) -> dict:
+    """Extract places from freeform pasted text (the 'paste your own itinerary'
+    import mode). Moves this Claude call server-side so the mobile app no longer
+    ships an Anthropic API key. Same response shape as the URL endpoints."""
+    started = time.perf_counter()
+    text = (req.text or "").strip()
+    if not text:
+        return {
+            "source": "text",
+            "places": [],
+            "places_source": "text",
+            "suggested_city": None,
+            "truncated": False,
+            "_elapsed_ms": 0,
+        }
+
+    truncated = len(text) > MAX_TEXT_CHARS
+    if truncated:
+        text = text[:MAX_TEXT_CHARS]
+
+    places = extract_places_from_text(text=text, city_hint=req.city_hint)
+
+    suggested_city = None
+    for p in places:
+        if p.get("city"):
+            suggested_city = p["city"]
+            break
+    if not suggested_city and req.city_hint:
+        suggested_city = req.city_hint
+
+    return {
+        "source": "text",
+        "places": places,
+        "places_source": "text",
+        "suggested_city": suggested_city,
+        "truncated": truncated,
         "_elapsed_ms": int((time.perf_counter() - started) * 1000),
     }
