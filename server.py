@@ -1,18 +1,140 @@
 """FastAPI wrapper around extract.py / places.py for the trippple-react import flow."""
 
+import asyncio
+import logging
+import os
+import re
+import secrets
 import time
-from typing import Optional
+from contextlib import asynccontextmanager
+from typing import Callable, Optional
 
-from fastapi import FastAPI, HTTPException
+import anyio
+import anyio.to_thread
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
+    RateLimitError,
+)
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yt_dlp.utils import DownloadError
 
+import net
+import places
+from cache import ResultCache
 from extract import extract, fetch_comments
 from extract_instagram import extract_instagram
 from places import extract_places
 
-app = FastAPI(title="trippple tiktok extraction")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+log = logging.getLogger("extraction")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("ignoring non-integer %s=%r; using %d", name, raw, default)
+        return default
+
+
+# How many extractions may touch TikTok/Instagram/Anthropic at once.
+#
+# Deliberately small. FastAPI runs sync `def` endpoints on anyio's threadpool,
+# which defaults to 40 — so the previous version would fire up to 40 concurrent
+# anonymous requests at one social platform from a single datacenter IP, which
+# is exactly how that IP gets blocked. Our ceiling is what the upstreams
+# tolerate, not what the box can run.
+MAX_CONCURRENCY = _env_int("EXTRACT_MAX_CONCURRENCY", 6)
+
+# How many requests may *wait* for a slot before we start shedding.
+#
+# An unbounded queue is worse than a rejection. The app gives up at 45s, but a
+# thread already inside yt-dlp cannot be cancelled, so the server keeps paying
+# for work nobody will ever read — and the import modal's "Try Again" button
+# then piles more on top. A bounded queue is what stops a burst from turning
+# into a death spiral.
+MAX_QUEUE = _env_int("EXTRACT_MAX_QUEUE", 24)
+
+# Answer before the app's 45s client timeout so it sees a real status code
+# rather than an aborted socket.
+DEADLINE_S = _env_int("EXTRACT_DEADLINE_S", 40)
+
+CACHE_TTL_S = _env_int("EXTRACT_CACHE_TTL_S", 3600)
+CACHE_MAX_ENTRIES = _env_int("EXTRACT_CACHE_MAX_ENTRIES", 500)
+
+# Opt-in shared-key gate, matching services/extractAuth.ts on the app side.
+# Unset (the default) leaves the endpoints open — which is how they run today.
+EXTRACT_API_KEY = os.environ.get("EXTRACT_API_KEY") or ""
+
+_limiter = anyio.CapacityLimiter(MAX_CONCURRENCY)
+_cache = ResultCache(ttl_s=CACHE_TTL_S, max_entries=CACHE_MAX_ENTRIES)
+_inflight = 0
+_llm_status = "unchecked"
+
+# Upstream telling us it is refusing *this IP*, as opposed to the post being
+# deleted or private. Worth its own status so the two don't blur together in
+# logs — one means "buy a proxy", the other means "nothing to do".
+_BLOCKED_RE = re.compile(
+    r"IP address is blocked|empty media response|rate.?limit|login required|"
+    r"sign in to confirm|not available in your (country|region)",
+    re.IGNORECASE,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Validate the Anthropic key once at boot.
+
+    Every import runs a Claude call server-side, so a missing or rotated key
+    breaks the whole service — previously as an opaque 500 per request, with
+    nothing in /health to say why. One cheap call at startup turns that into a
+    loud log line and a visible health field.
+    """
+    global _llm_status
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        _llm_status = "missing_key"
+        log.critical(
+            "ANTHROPIC_API_KEY is not set — every extraction will fail at the places step"
+        )
+    else:
+        try:
+            await anyio.to_thread.run_sync(places.ping)
+            _llm_status = "ok"
+            log.info("anthropic key validated (model=%s)", places.MODEL)
+        except AuthenticationError:
+            _llm_status = "auth_failed"
+            log.critical(
+                "ANTHROPIC_API_KEY was rejected (401) — every extraction will fail at "
+                "the places step. Has the key been rotated without updating this service?"
+            )
+        except Exception as exc:  # network hiccup at boot shouldn't crashloop us
+            _llm_status = "unreachable"
+            log.error("could not validate ANTHROPIC_API_KEY: %s", exc)
+
+    log.info(
+        "extraction service up: max_concurrency=%d max_queue=%d deadline=%ds "
+        "cache_ttl=%ds auth_gate=%s proxy=%s cookies=%s",
+        MAX_CONCURRENCY,
+        MAX_QUEUE,
+        DEADLINE_S,
+        CACHE_TTL_S,
+        bool(EXTRACT_API_KEY),
+        bool(net.proxy_url()),
+        bool(net.cookie_file()),
+    )
+    yield
+
+
+app = FastAPI(title="trippple tiktok extraction", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,23 +151,97 @@ app.add_middleware(
 
 class ExtractRequest(BaseModel):
     url: str
-    city_hint: Optional[str] = None
+    city_hint: Optional[str] = None  # accepted for app compatibility; unused today
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"ok": True}
+def _require_key(provided: Optional[str]) -> None:
+    if not EXTRACT_API_KEY:
+        return
+    if not provided or not secrets.compare_digest(provided, EXTRACT_API_KEY):
+        raise HTTPException(status_code=401, detail="invalid_extract_key")
 
 
-@app.post("/tiktok/extract")
-def tiktok_extract(req: ExtractRequest) -> dict:
-    started = time.perf_counter()
+def _http_error_for(exc: BaseException) -> HTTPException:
+    """Map an internal failure onto a status the client can act on.
+
+    Previously only `extract()` was wrapped, so anything that went wrong in
+    fetch_comments/extract_places escaped as a bare text 500 with no clue as to
+    which of the three upstreams (TikTok, Instagram, Anthropic) had failed.
+    """
+    if isinstance(exc, DownloadError):
+        message = str(exc)
+        if _BLOCKED_RE.search(message):
+            return HTTPException(502, detail=f"upstream_blocked: {message}")
+        return HTTPException(502, detail=f"extraction_failed: {message}")
+    if isinstance(exc, AuthenticationError):
+        return HTTPException(503, detail="llm_auth_failed: ANTHROPIC_API_KEY rejected")
+    if isinstance(exc, RateLimitError):
+        return HTTPException(
+            429, detail="llm_rate_limited", headers={"Retry-After": "10"}
+        )
+    if isinstance(exc, (APIConnectionError, APIStatusError)):
+        return HTTPException(502, detail=f"llm_failed: {exc}")
+    return HTTPException(500, detail=f"unexpected: {type(exc).__name__}: {exc}")
+
+
+async def _await_with_deadline(awaitable, cache_key: str):
     try:
-        info = extract(req.url)
-    except DownloadError as e:
-        raise HTTPException(status_code=502, detail=f"extraction_failed: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"unexpected: {e}")
+        with anyio.fail_after(DEADLINE_S):
+            return await awaitable
+    except TimeoutError:
+        raise HTTPException(
+            504, detail=f"timeout: no result within {DEADLINE_S}s"
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("extraction failed: %s", cache_key)
+        raise _http_error_for(exc) from exc
+
+
+async def _guarded(cache_key: str, work: Callable[[], dict]) -> dict:
+    """Admission control + coalescing + deadline around one blocking extraction."""
+    global _inflight
+
+    # Served straight from cache: no slot, no queue, never shed.
+    cached = _cache.peek(cache_key)
+    if cached is not None:
+        return {**cached, "_cache": "hit"}
+
+    # Someone is already extracting this exact URL. Join them. This costs no
+    # thread and no upstream slot, so it must skip admission control entirely:
+    # a hundred people importing the same viral post is the case we most want
+    # to serve, not the one we shed. `shield` keeps our own deadline (or a
+    # client hang-up) from cancelling the extraction everyone else is awaiting.
+    existing = _cache.inflight(cache_key)
+    if existing is not None:
+        value = await _await_with_deadline(asyncio.shield(existing), cache_key)
+        return {**value, "_cache": "coalesced"}
+
+    # From here on we are doing real upstream work, so we are admission-controlled.
+    if _inflight >= MAX_CONCURRENCY + MAX_QUEUE:
+        log.warning("shedding request (%d in flight): %s", _inflight, cache_key)
+        raise HTTPException(503, detail="overloaded", headers={"Retry-After": "5"})
+
+    _inflight += 1
+    try:
+
+        async def produce() -> dict:
+            return await anyio.to_thread.run_sync(
+                work, limiter=_limiter, abandon_on_cancel=True
+            )
+
+        value = await _await_with_deadline(
+            _cache.produce(cache_key, produce), cache_key
+        )
+        return {**value, "_cache": "miss"}
+    finally:
+        _inflight -= 1
+
+
+def _tiktok_work(url: str) -> dict:
+    started = time.perf_counter()
+    info = extract(url)
 
     # Always pull top comments and merge into the LLM input. Captions often
     # under-specify (creator names 2 spots in the caption but rattles off 10
@@ -53,10 +249,9 @@ def tiktok_extract(req: ExtractRequest) -> dict:
     # to fetch, so the cost is one HTTP call + a slightly fatter LLM prompt.
     comments = fetch_comments(
         aweme_id=info.get("id") or "",
-        referer=info.get("canonical_url") or req.url,
+        referer=info.get("canonical_url") or url,
         count=50,
     )
-    used_comments = len(comments)
     existing_transcript = info.get("transcript") or ""
     if comments:
         comment_text = "\n".join(
@@ -71,7 +266,7 @@ def tiktok_extract(req: ExtractRequest) -> dict:
         merged_transcript = existing_transcript or None
 
     places_started = time.perf_counter()
-    places = extract_places(
+    found = extract_places(
         caption=info["caption"],
         transcript=merged_transcript,
         hashtags=info.get("hashtags") or [],
@@ -79,21 +274,16 @@ def tiktok_extract(req: ExtractRequest) -> dict:
         suggested_words=info.get("suggested_words") or [],
         location_created=info.get("location_created"),
     )
-    places_source = "caption_plus_comments" if comments else "caption_only"
     places_ms = int((time.perf_counter() - places_started) * 1000)
 
-    suggested_city = None
-    for p in places:
-        if p.get("city"):
-            suggested_city = p["city"]
-            break
+    suggested_city = next((p["city"] for p in found if p.get("city")), None)
     if not suggested_city and info.get("location_created"):
         suggested_city = info["location_created"]
 
     return {
         "source": "tiktok",
-        "places": places,
-        "places_source": places_source,
+        "places": found,
+        "places_source": "caption_plus_comments" if comments else "caption_only",
         "suggested_city": suggested_city,
         "thumbnail": info.get("thumbnail"),
         "transcript": info.get("transcript"),
@@ -101,23 +291,17 @@ def tiktok_extract(req: ExtractRequest) -> dict:
         "author": info.get("author"),
         "canonical_url": info.get("canonical_url"),
         "_places_ms": places_ms,
-        "_comments_used": used_comments,
+        "_comments_used": len(comments),
         "_elapsed_ms": int((time.perf_counter() - started) * 1000),
     }
 
 
-@app.post("/instagram/extract")
-def instagram_extract(req: ExtractRequest) -> dict:
+def _instagram_work(url: str) -> dict:
     started = time.perf_counter()
-    try:
-        info = extract_instagram(req.url)
-    except DownloadError as e:
-        raise HTTPException(status_code=502, detail=f"extraction_failed: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"unexpected: {e}")
+    info = extract_instagram(url)
 
     places_started = time.perf_counter()
-    places = extract_places(
+    found = extract_places(
         caption=info["caption"],
         transcript=None,
         hashtags=info.get("hashtags") or [],
@@ -127,17 +311,11 @@ def instagram_extract(req: ExtractRequest) -> dict:
     )
     places_ms = int((time.perf_counter() - places_started) * 1000)
 
-    suggested_city = None
-    for p in places:
-        if p.get("city"):
-            suggested_city = p["city"]
-            break
-
     return {
         "source": "instagram",
-        "places": places,
+        "places": found,
         "places_source": "primary",
-        "suggested_city": suggested_city,
+        "suggested_city": next((p["city"] for p in found if p.get("city")), None),
         "thumbnail": info.get("thumbnail"),
         "transcript": None,
         "caption": info.get("caption"),
@@ -146,3 +324,34 @@ def instagram_extract(req: ExtractRequest) -> dict:
         "_places_ms": places_ms,
         "_elapsed_ms": int((time.perf_counter() - started) * 1000),
     }
+
+
+@app.get("/health")
+def health() -> dict:
+    return {
+        "ok": _llm_status == "ok",
+        "llm": _llm_status,
+        "inflight": _inflight,
+        "capacity": {"max_concurrency": MAX_CONCURRENCY, "max_queue": MAX_QUEUE},
+        "cache": _cache.stats(),
+        "proxy": bool(net.proxy_url()),
+        "cookies": bool(net.cookie_file()),
+    }
+
+
+@app.post("/tiktok/extract")
+async def tiktok_extract(
+    req: ExtractRequest,
+    x_extract_key: Optional[str] = Header(default=None),
+) -> dict:
+    _require_key(x_extract_key)
+    return await _guarded(f"tiktok:{req.url}", lambda: _tiktok_work(req.url))
+
+
+@app.post("/instagram/extract")
+async def instagram_extract(
+    req: ExtractRequest,
+    x_extract_key: Optional[str] = Header(default=None),
+) -> dict:
+    _require_key(x_extract_key)
+    return await _guarded(f"instagram:{req.url}", lambda: _instagram_work(req.url))
