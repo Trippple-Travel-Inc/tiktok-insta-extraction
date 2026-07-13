@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import anyio
 import anyio.to_thread
@@ -46,23 +46,37 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# How many extractions may touch TikTok/Instagram/Anthropic at once.
+# An extraction has two phases with completely different constraints, so they
+# get separate limiters. Measured against prod (2026-07-13, warm):
 #
-# Deliberately small. FastAPI runs sync `def` endpoints on anyio's threadpool,
-# which defaults to 40 — so the previous version would fire up to 40 concurrent
-# anonymous requests at one social platform from a single datacenter IP, which
-# is exactly how that IP gets blocked. Our ceiling is what the upstreams
-# tolerate, not what the box can run.
-MAX_CONCURRENCY = _env_int("EXTRACT_MAX_CONCURRENCY", 6)
+#     yt-dlp + page scrape + 50 comments  ~1.2s   15% of the wall clock
+#     Claude (extract_places)             ~6.5s   85% of the wall clock
+#
+# Gating both behind one limiter throttles the wrong thing. The platform calls
+# are what get a datacenter IP blocked, and they're the short phase; Anthropic
+# tolerates far more concurrency than TikTok does, and it's where the time
+# actually goes. One shared limiter of N would cap throughput at N/7.5 req/s
+# while leaving TikTok exposure unchanged — strictly worse on both axes.
 
-# How many requests may *wait* for a slot before we start shedding.
+# Concurrent requests allowed to touch TikTok/Instagram. Deliberately small:
+# this is the number that decides whether our IP gets blocked. (FastAPI would
+# otherwise run sync endpoints on a 40-thread pool — 40 simultaneous anonymous
+# hits from one IP, which is how we got blocked in the first place.)
+SCRAPE_CONCURRENCY = _env_int("EXTRACT_SCRAPE_CONCURRENCY", 6)
+
+# Concurrent Claude calls. Bounded by Anthropic's rate limits, not by any IP
+# reputation, so it can be much higher. This is the real throughput lever.
+LLM_CONCURRENCY = _env_int("EXTRACT_LLM_CONCURRENCY", 24)
+
+# Total requests admitted (running + queued) before we start shedding.
 #
-# An unbounded queue is worse than a rejection. The app gives up at 45s, but a
-# thread already inside yt-dlp cannot be cancelled, so the server keeps paying
-# for work nobody will ever read — and the import modal's "Try Again" button
-# then piles more on top. A bounded queue is what stops a burst from turning
-# into a death spiral.
-MAX_QUEUE = _env_int("EXTRACT_MAX_QUEUE", 24)
+# Sized against the deadline, not plucked from air. At ~3.7 req/s sustained
+# (min of 6/1.2s scrape and 24/6.5s LLM), 96 requests drain in ~26s, so even
+# the last one answers inside DEADLINE_S. Admitting more than we can finish is
+# worse than a rejection: the app gives up at 45s, but a thread inside yt-dlp
+# cannot be cancelled, so we'd keep paying for work nobody will read — and the
+# modal's "Try Again" button then piles more on top.
+MAX_INFLIGHT = _env_int("EXTRACT_MAX_INFLIGHT", 96)
 
 # Answer before the app's 45s client timeout so it sees a real status code
 # rather than an aborted socket.
@@ -75,7 +89,8 @@ CACHE_MAX_ENTRIES = _env_int("EXTRACT_CACHE_MAX_ENTRIES", 500)
 # Unset (the default) leaves the endpoints open — which is how they run today.
 EXTRACT_API_KEY = os.environ.get("EXTRACT_API_KEY") or ""
 
-_limiter = anyio.CapacityLimiter(MAX_CONCURRENCY)
+_scrape_limiter = anyio.CapacityLimiter(SCRAPE_CONCURRENCY)
+_llm_limiter = anyio.CapacityLimiter(LLM_CONCURRENCY)
 _cache = ResultCache(ttl_s=CACHE_TTL_S, max_entries=CACHE_MAX_ENTRIES)
 _inflight = 0
 _llm_status = "unchecked"
@@ -121,10 +136,11 @@ async def lifespan(app: FastAPI):
             log.error("could not validate ANTHROPIC_API_KEY: %s", exc)
 
     log.info(
-        "extraction service up: max_concurrency=%d max_queue=%d deadline=%ds "
-        "cache_ttl=%ds auth_gate=%s proxy=%s cookies=%s",
-        MAX_CONCURRENCY,
-        MAX_QUEUE,
+        "extraction service up: scrape_concurrency=%d llm_concurrency=%d "
+        "max_inflight=%d deadline=%ds cache_ttl=%ds auth_gate=%s proxy=%s cookies=%s",
+        SCRAPE_CONCURRENCY,
+        LLM_CONCURRENCY,
+        MAX_INFLIGHT,
         DEADLINE_S,
         CACHE_TTL_S,
         bool(EXTRACT_API_KEY),
@@ -199,7 +215,7 @@ async def _await_with_deadline(awaitable, cache_key: str):
         raise _http_error_for(exc) from exc
 
 
-async def _guarded(cache_key: str, work: Callable[[], dict]) -> dict:
+async def _guarded(cache_key: str, pipeline: Callable[[], "Awaitable[dict]"]) -> dict:
     """Admission control + coalescing + deadline around one blocking extraction."""
     global _inflight
 
@@ -219,28 +235,36 @@ async def _guarded(cache_key: str, work: Callable[[], dict]) -> dict:
         return {**value, "_cache": "coalesced"}
 
     # From here on we are doing real upstream work, so we are admission-controlled.
-    if _inflight >= MAX_CONCURRENCY + MAX_QUEUE:
+    if _inflight >= MAX_INFLIGHT:
         log.warning("shedding request (%d in flight): %s", _inflight, cache_key)
         raise HTTPException(503, detail="overloaded", headers={"Retry-After": "5"})
 
     _inflight += 1
     try:
 
-        async def produce() -> dict:
-            return await anyio.to_thread.run_sync(
-                work, limiter=_limiter, abandon_on_cancel=True
-            )
-
         value = await _await_with_deadline(
-            _cache.produce(cache_key, produce), cache_key
+            _cache.produce(cache_key, pipeline), cache_key
         )
         return {**value, "_cache": "miss"}
     finally:
         _inflight -= 1
 
 
-def _tiktok_work(url: str) -> dict:
-    started = time.perf_counter()
+async def _scrape(fn, *args):
+    """Platform-facing phase. Tight limiter: this is what gets our IP blocked."""
+    return await anyio.to_thread.run_sync(
+        lambda: fn(*args), limiter=_scrape_limiter, abandon_on_cancel=True
+    )
+
+
+async def _llm(fn, **kwargs):
+    """Anthropic-facing phase. Looser limiter: bounded by rate limits, not IP reputation."""
+    return await anyio.to_thread.run_sync(
+        lambda: fn(**kwargs), limiter=_llm_limiter, abandon_on_cancel=True
+    )
+
+
+def _tiktok_scrape(url: str) -> tuple[dict, list[dict]]:
     info = extract(url)
 
     # Always pull top comments and merge into the LLM input. Captions often
@@ -265,10 +289,19 @@ def _tiktok_work(url: str) -> dict:
     else:
         merged_transcript = existing_transcript or None
 
+    info["_merged_transcript"] = merged_transcript
+    return info, comments
+
+
+async def _tiktok_pipeline(url: str) -> dict:
+    started = time.perf_counter()
+    info, comments = await _scrape(_tiktok_scrape, url)
+
     places_started = time.perf_counter()
-    found = extract_places(
+    found = await _llm(
+        extract_places,
         caption=info["caption"],
-        transcript=merged_transcript,
+        transcript=info.get("_merged_transcript"),
         hashtags=info.get("hashtags") or [],
         stickers=info.get("stickers") or [],
         suggested_words=info.get("suggested_words") or [],
@@ -296,12 +329,13 @@ def _tiktok_work(url: str) -> dict:
     }
 
 
-def _instagram_work(url: str) -> dict:
+async def _instagram_pipeline(url: str) -> dict:
     started = time.perf_counter()
-    info = extract_instagram(url)
+    info = await _scrape(extract_instagram, url)
 
     places_started = time.perf_counter()
-    found = extract_places(
+    found = await _llm(
+        extract_places,
         caption=info["caption"],
         transcript=None,
         hashtags=info.get("hashtags") or [],
@@ -332,7 +366,11 @@ def health() -> dict:
         "ok": _llm_status == "ok",
         "llm": _llm_status,
         "inflight": _inflight,
-        "capacity": {"max_concurrency": MAX_CONCURRENCY, "max_queue": MAX_QUEUE},
+        "capacity": {
+            "scrape_concurrency": SCRAPE_CONCURRENCY,
+            "llm_concurrency": LLM_CONCURRENCY,
+            "max_inflight": MAX_INFLIGHT,
+        },
         "cache": _cache.stats(),
         "proxy": bool(net.proxy_url()),
         "cookies": bool(net.cookie_file()),
@@ -345,7 +383,7 @@ async def tiktok_extract(
     x_extract_key: Optional[str] = Header(default=None),
 ) -> dict:
     _require_key(x_extract_key)
-    return await _guarded(f"tiktok:{req.url}", lambda: _tiktok_work(req.url))
+    return await _guarded(f"tiktok:{req.url}", lambda: _tiktok_pipeline(req.url))
 
 
 @app.post("/instagram/extract")
@@ -354,4 +392,4 @@ async def instagram_extract(
     x_extract_key: Optional[str] = Header(default=None),
 ) -> dict:
     _require_key(x_extract_key)
-    return await _guarded(f"instagram:{req.url}", lambda: _instagram_work(req.url))
+    return await _guarded(f"instagram:{req.url}", lambda: _instagram_pipeline(req.url))

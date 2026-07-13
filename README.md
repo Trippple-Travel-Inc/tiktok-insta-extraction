@@ -67,8 +67,9 @@ All optional except `ANTHROPIC_API_KEY`.
 | Env var | Default | What it does |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | — | **Required.** Every import runs a Claude call server-side. Validated once at boot; if it's missing or rejected, `/health` reports `llm: auth_failed` and logs CRITICAL. |
-| `EXTRACT_MAX_CONCURRENCY` | `6` | Extractions allowed to touch TikTok/Instagram/Anthropic at once. |
-| `EXTRACT_MAX_QUEUE` | `24` | Requests allowed to wait for a slot. Past this we return `503` + `Retry-After`. |
+| `EXTRACT_SCRAPE_CONCURRENCY` | `6` | Concurrent requests allowed to touch TikTok/Instagram. This is the number that decides whether our IP gets blocked. |
+| `EXTRACT_LLM_CONCURRENCY` | `24` | Concurrent Claude calls. Bounded by Anthropic rate limits, not IP reputation — so it can be much higher. |
+| `EXTRACT_MAX_INFLIGHT` | `96` | Total requests admitted (running + queued) before we shed with `503` + `Retry-After`. |
 | `EXTRACT_DEADLINE_S` | `40` | Per-request ceiling. Kept under the app's 45s client timeout. |
 | `EXTRACT_CACHE_TTL_S` | `3600` | How long an extracted result is reused for the same URL. |
 | `EXTRACT_API_KEY` | unset | Opt-in shared-key gate. When set, requests must send a matching `X-Extract-Key`. Pairs with `EXPO_PUBLIC_EXTRACT_KEY` in the app. Unset = endpoints are open. |
@@ -77,19 +78,37 @@ All optional except `ANTHROPIC_API_KEY`.
 
 ### Tuning the concurrency limits
 
-The binding constraint is not CPU — it's that TikTok and Instagram block a
-datacenter IP that hits them too hard. So the goal is a low, *deliberate*
-ceiling, not a high one. FastAPI runs sync `def` endpoints on a 40-thread pool
-by default, which would mean up to 40 simultaneous anonymous requests from one
-IP; the endpoints are `async def` and gated by an explicit limiter instead.
+An extraction has two phases with completely different constraints. Measured
+against prod (2026-07-13, warm, 50 comments merged):
 
-`MAX_QUEUE` is sized against `DEADLINE_S`: with 6 concurrent and ~5s per
-extraction, the 24th queued request waits ~20s and still answers inside the 40s
-deadline. If you raise `MAX_QUEUE`, the tail starts timing out instead of being
-told to retry — which is worse, because a thread inside yt-dlp cannot be
-cancelled, so the server keeps paying for work the app has already given up on.
+| Phase | Time | Share | Constrained by |
+| --- | --- | --- | --- |
+| yt-dlp + page scrape + comments | ~1.2s | 15% | **TikTok/Instagram IP reputation** |
+| Claude (`extract_places`) | ~6.5s | 85% | Anthropic rate limits |
 
-**To serve more load, add upstream capacity (proxies), not queue depth.**
+So they get **separate limiters**. Gating both behind one number throttles the
+wrong thing: the platform calls are what get a datacenter IP blocked, and
+they're the *short* phase, while Anthropic — which tolerates far more
+concurrency than TikTok does — is where the wall-clock actually goes.
+
+The difference is not marginal. Against a burst of 100 distinct URLs:
+
+| | served | shed | peak TikTok concurrency |
+| --- | --- | --- | --- |
+| one limiter of 6 | 30 | 70 | 6 |
+| split 6 scrape / 24 LLM | **96** | 4 | **6** |
+
+Same IP exposure, 3x the throughput.
+
+`MAX_INFLIGHT` is sized against `DEADLINE_S`, not picked by feel: at ~3.7 req/s
+sustained (the min of 6/1.2s and 24/6.5s), 96 requests drain in ~26s, so even
+the last one answers inside the 40s deadline. Raising it past what we can finish
+is worse than a rejection — the app gives up at 45s, but a thread inside yt-dlp
+cannot be cancelled, so we'd keep paying for work nobody will read.
+
+**To serve more TikTok traffic, add upstream capacity (proxies) — not queue
+depth.** `EXTRACT_SCRAPE_CONCURRENCY` is the one number you should not raise
+without one.
 
 ### Load test
 
